@@ -6,6 +6,10 @@ const nextConfig: NextConfig = {
   agentRules: false,
   // postgres.js usa módulos de Node: no lo empaquetamos en el build de Node
   serverExternalPackages: ["postgres"],
+  // Build para Node en un servidor propio (deploy/, Docker): NEXT_OUTPUT=standalone
+  // arma .next/standalone con server.js. El build de Cloudflare (OpenNext) no
+  // define esta variable y sigue igual que antes.
+  ...(process.env.NEXT_OUTPUT === "standalone" ? { output: "standalone" as const } : {}),
 };
 
 export default nextConfig;

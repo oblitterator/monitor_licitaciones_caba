@@ -4,10 +4,13 @@ Sitio público sobre las contrataciones de la Ciudad de Buenos Aires publicadas 
 base PostgreSQL que arma el paquete `monitor_licitaciones` (ver el README de la raíz) y no tiene API propia: las páginas
 son React Server Components que consultan Postgres.
 
+Para correrlo, desplegarlo y colaborar: **[docs/COLABORAR.md](../docs/COLABORAR.md)**.
+
 - Next.js 16 (App Router), TypeScript estricto, CSS plano con el sistema visual de Claude Design (`app/globals.css`).
 - Driver `postgres` (postgres.js) detrás de un único módulo, `lib/db.ts`. Todo el SQL es parametrizado y de solo
   lectura, salvo los formularios, que escriben únicamente en el esquema `app`.
-- Se despliega en Cloudflare Workers con `@opennextjs/cloudflare`; en producción la conexión pasa por Hyperdrive.
+- Producción: servidor Node *standalone* en Docker, junto a la base (`../deploy/`). Alternativa: Cloudflare Workers
+  con `@opennextjs/cloudflare`, donde la conexión pasa por Hyperdrive.
 - Lecturas cacheadas una hora (`unstable_cache`, `lib/datos.ts`): los datos cambian una vez por día.
 - Casi sin JavaScript en el cliente: solo los formularios (alertas, reportes) y el widget de Turnstile.
 
@@ -88,6 +91,19 @@ Si el Postgres no tiene `pg_trgm` (por ejemplo el embebido de `pgserver`), crear
 y `pg_restore -L lista`) y aceptar que falle el índice `gin_trgm_ops`; al aplicar los `.sql` hay que quitar la línea
 `CREATE EXTENSION pg_trgm` y las que usan `gin_trgm_ops`. El sitio no usa trigramas.
 
+## Servidor propio (Node standalone, Docker)
+
+Es el despliegue de producción: `../deploy/docker-compose.yml` arma la imagen con `../deploy/web/Dockerfile`.
+
+```bash
+pnpm build:node                  # NEXT_OUTPUT=standalone next build -> .next/standalone/server.js
+cp -r .next/static .next/standalone/.next/static
+DATABASE_URL=postgres://... PORT=3000 node .next/standalone/server.js
+```
+
+`output: "standalone"` se activa solo con `NEXT_OUTPUT=standalone`, así el build de Workers (`build:cf`) no cambia.
+`/salud` responde `{"ok":true}` si el server llega a Postgres (lo usa el healthcheck de Docker).
+
 ## Cloudflare (Workers + Hyperdrive)
 
 1. Hyperdrive, apuntando al usuario `monitor_web` (la cadena con contraseña se pasa solo por la línea de comandos o
@@ -111,7 +127,7 @@ y `pg_restore -L lista`) y aceptar que falle el índice `gin_trgm_ops`; al aplic
    ```
 5. Desplegar: `pnpm deploy`.
 
-Scripts: `dev`, `build` (Next), `build:cf` (`opennextjs-cloudflare build`), `preview`, `deploy`, `cf-typegen`.
+Scripts: `dev`, `build` (Next), `build:node` (standalone para Docker), `build:cf` (`opennextjs-cloudflare build`), `preview`, `deploy`, `cf-typegen`.
 
 ## Alertas: qué falta
 
