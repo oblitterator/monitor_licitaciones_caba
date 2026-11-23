@@ -5,6 +5,8 @@ Autónoma de Buenos Aires, orientado a la detección de señales de riesgo en la
 
 **Autor:** Juan Nieve
 
+> ¿Querés sumarte, correrlo en tu máquina o mantener el servidor? Leé **[docs/COLABORAR.md](docs/COLABORAR.md)**.
+
 ---
 
 # 📘 Introducción
@@ -84,7 +86,8 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 │   ├── 001_esquema.sql              # Tablas y normalización de razones sociales
 │   ├── 020_funciones.sql            # Migración desde v1 y resolución de CUIT
 │   ├── 040_analitica.sql            # Vistas de procesos, señales y controles de calidad
-│   └── 050_llm.sql                  # Extracciones con LLM y su mezcla con las reglas
+│   ├── 050_llm.sql                  # Extracciones con LLM y su mezcla con las reglas
+│   └── 060_web.sql                  # Vistas materializadas y tablas del sitio
 │
 ├── 📂 notebooks
 │   ├── 01_calidad.ipynb             # Cobertura, calidad del parser y revisión manual
@@ -92,6 +95,9 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 │   └── _construir.py                # Generación de los notebooks desde código
 │
 ├── 📂 tests                         # Casos con textos reales del Boletín + integración
+├── 📂 web                           # Sitio público (Next.js)
+├── 📂 deploy                        # Producción: Docker Compose y scripts de operación
+├── 📂 docs                          # COLABORAR.md: guía para colaborar y operar
 ├── pyproject.toml
 └── README.md
 ```
