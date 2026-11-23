@@ -4,25 +4,31 @@ Comandos (todos idempotentes; se pueden re-ejecutar sin duplicar):
   init-db                       crea/actualiza esquemas, tablas, funciones y vistas
   migrar-v1                     copia normas, textos y padrón de empresas desde public (v1)
   boletines --desde --hasta     baja boletines y normas de la API
-  pdfs [--limite N]             baja PDFs pendientes y extrae texto
+  pdfs [--limite N] [--concurrencia 6] [--intervalo 0.15]
+                                baja PDFs pendientes en paralelo (educado) y extrae texto
   parsear [--todo]              parsea actos de licitación (solo nuevos o de versión vieja)
   resolver                      resuelve CUIT de las firmas (texto, alias, padrón)
   bac [--archivo f.csv]         guarda un snapshot del OCDS de BAC
   ipc --csv f.csv               carga serie IPC (columnas: mes=AAAA-MM, indice)
   actualizar                    corrida diaria: boletines desde la última fecha + pdfs + parsear + resolver
   calidad                       muestra cobertura y calidad de la extracción
+  llm-enviar [--dry-run]        manda los actos de confianza media/baja a Claude Haiku (Batches API)
+  llm-recolectar [--lote ID]    baja los resultados del batch, los verifica y los guarda en bo.acto_llm
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import sys
 from datetime import date, timedelta
 from pathlib import Path
 
 from . import bac as bac_mod
+from . import llm as llm_mod
 from .api_bo import BoletinAPI
+from .descarga import CONCURRENCIA_DEFECTO, CONCURRENCIA_MAXIMA, INTERVALO_DEFECTO
 from .db import conectar, ejecucion, init_db
 from .ingesta import cargar_boletines, parsear_documentos, procesar_pdfs
 
@@ -31,6 +37,13 @@ log = logging.getLogger("monitor_licitaciones")
 
 def _fecha(s: str) -> date:
     return date.fromisoformat(s)
+
+
+def _concurrencia(s: str) -> int:
+    n = int(s)
+    if not 1 <= n <= CONCURRENCIA_MAXIMA:
+        raise argparse.ArgumentTypeError(f"entre 1 y {CONCURRENCIA_MAXIMA} (es un servidor público)")
+    return n
 
 
 def _imprimir(cur) -> None:
@@ -64,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("pdfs")
     d.add_argument("--limite", type=int, default=500)
     d.add_argument("--max-intentos", type=int, default=3)
+    d.add_argument("--concurrencia", type=_concurrencia, default=CONCURRENCIA_DEFECTO, help="descargas en paralelo")
+    d.add_argument("--intervalo", type=float, default=INTERVALO_DEFECTO, help="segundos mínimos entre pedidos")
     pa = sub.add_parser("parsear")
     pa.add_argument("--todo", action="store_true", help="re-parsear todo, aunque la versión coincida")
     sub.add_parser("resolver")
@@ -73,7 +88,15 @@ def main(argv: list[str] | None = None) -> int:
     ip.add_argument("--csv", type=Path, required=True)
     ac = sub.add_parser("actualizar")
     ac.add_argument("--limite-pdfs", type=int, default=2000)
+    ac.add_argument("--concurrencia", type=_concurrencia, default=CONCURRENCIA_DEFECTO, help="descargas de PDF en paralelo")
     sub.add_parser("calidad")
+    le = sub.add_parser("llm-enviar")
+    le.add_argument("--dry-run", action="store_true", help="no manda nada: cuenta pedidos y estima el costo")
+    le.add_argument("--limite", type=int, help="máximo de actos a mandar")
+    le.add_argument("--confianza", default=",".join(llm_mod.CONFIANZAS_DEFECTO), help="confianzas a mandar (media,baja)")
+    le.add_argument("--archivo", type=Path, help="escribe los pedidos en un JSONL (para revisarlos)")
+    lr = sub.add_parser("llm-recolectar")
+    lr.add_argument("--lote", help="id de un batch puntual (por defecto, todos los pendientes)")
     a = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
@@ -96,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
             cargar_boletines(conn, ej, BoletinAPI(pausa=a.pausa), a.desde, a.hasta, a.forzar)
 
         elif a.cmd == "pdfs":
-            procesar_pdfs(conn, ej, limite=a.limite, max_intentos=a.max_intentos)
+            procesar_pdfs(conn, ej, limite=a.limite, max_intentos=a.max_intentos,
+                          concurrencia=a.concurrencia, intervalo=a.intervalo)
 
         elif a.cmd == "parsear":
             parsear_documentos(conn, ej, todo=a.todo)
@@ -130,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                             "WHERE resultado = 'con_boletin'")
                 desde = cur.fetchone()[0] + timedelta(days=1)
             cargar_boletines(conn, ej, BoletinAPI(), desde, date.today())
-            procesar_pdfs(conn, ej, limite=a.limite_pdfs)
+            procesar_pdfs(conn, ej, limite=a.limite_pdfs, concurrencia=a.concurrencia)
             parsear_documentos(conn, ej)
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM ref.resolver_cuit()")
@@ -147,6 +171,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"== {titulo}")
                     cur.execute(q)
                     _imprimir(cur)
+
+        elif a.cmd == "llm-enviar":
+            confianzas = [c.strip() for c in a.confianza.split(",") if c.strip()]
+            est = llm_mod.enviar(conn, ej, dry_run=a.dry_run, confianzas=confianzas, limite=a.limite,
+                                 archivo=str(a.archivo) if a.archivo else None)
+            print(("== dry-run (no se mandó nada)" if a.dry_run else "== enviado"))
+            print(json.dumps(est, indent=1, ensure_ascii=False))
+
+        elif a.cmd == "llm-recolectar":
+            llm_mod.recolectar(conn, ej, lote_id=a.lote)
 
     print({k: v for k, v in ej.resumen.items()} or "ok")
     return 0
