@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import logging
+import threading
 from datetime import date, timedelta
 from typing import Callable, Iterable, Optional
 
@@ -13,6 +13,7 @@ import requests
 
 from .api_bo import BoletinAPI, ErrorAPI, RespuestaBoletin
 from .db import Ejecucion
+from .descarga import CONCURRENCIA_DEFECTO, INTERVALO_DEFECTO, Descargador, bajar_y_extraer, sesion_pdfs
 from .parser_actos import PARSER_VERSION, parsear_acto
 
 log = logging.getLogger("monitor_licitaciones")
@@ -105,6 +106,19 @@ def marcar_fecha(conn: psycopg.Connection, fecha: date, resultado: str) -> None:
         )
 
 
+def clasificar_fecha(fecha: date, r: RespuestaBoletin) -> str:
+    """'con_boletin' | 'sin_boletin' | 'sin_publicar_aun'.
+    Para una fecha sin edición la API devuelve el último boletín publicado. Si ese boletín es POSTERIOR
+    a la fecha, la fecha no tuvo edición (definitivo). Si es ANTERIOR, la fecha es posterior a todo lo
+    publicado: puede ser feriado o puede que todavía no haya salido, así que no se da por cerrada."""
+    if r.boletin is None:
+        return "sin_boletin"
+    fp = r.fecha_publicacion
+    if fp is None or fp == fecha:
+        return "con_boletin"
+    return "sin_boletin" if fp > fecha else "sin_publicar_aun"
+
+
 def cargar_boletines(conn: psycopg.Connection, ej: Ejecucion, api: BoletinAPI,
                      desde: date, hasta: date, forzar: bool = False) -> None:
     for fecha in fechas_a_consultar(conn, desde, hasta, forzar):
@@ -117,13 +131,16 @@ def cargar_boletines(conn: psycopg.Connection, ej: Ejecucion, api: BoletinAPI,
             ej.sumar("fechas_error")
             log.warning("%s: %s", fecha, e)
             continue
-        if r.boletin is None or (r.fecha_publicacion and r.fecha_publicacion != fecha):
-            # sin edición ese día (la API puede devolver el boletín más cercano: se guarda igual)
+        clase = clasificar_fecha(fecha, r)
+        if clase in ("sin_boletin", "sin_publicar_aun"):
+            # sin edición ese día: la API devuelve el ÚLTIMO boletín publicado (se guarda igual)
             if r.boletin is not None and not r.error_normas:
                 guardar_respuesta(conn, r)
-            marcar_fecha(conn, fecha, "sin_boletin")
+            if clase == "sin_boletin":
+                marcar_fecha(conn, fecha, "sin_boletin")
+            # 'sin_publicar_aun' no se marca: la próxima corrida vuelve a consultar esa fecha
             conn.commit()
-            ej.sumar("fechas_sin_boletin")
+            ej.sumar(f"fechas_{clase}")
             continue
         if r.error_normas:
             ej.error("api_boletin", fecha.isoformat(), f"normas: {r.error_normas}")
@@ -139,29 +156,117 @@ def cargar_boletines(conn: psycopg.Connection, ej: Ejecucion, api: BoletinAPI,
         ej.sumar("normas", c["normas"])
         ej.sumar("pdf_pendientes", c["pdf_pendientes"])
         log.info("%s: boletín %s, %d normas", fecha, r.boletin.get("numero"), c["normas"])
+    completar_por_numero(conn, ej, api, desde, hasta)
+
+
+def numeros_faltantes(conocidos: Iterable[int], consultados: Iterable[int] = ()) -> list[int]:
+    """Huecos entre el menor y el mayor número conocido, sin los ya consultados."""
+    conocidos = set(conocidos)
+    if not conocidos:
+        return []
+    ya = conocidos | set(consultados)
+    return [n for n in range(min(conocidos), max(conocidos) + 1) if n not in ya]
+
+
+def completar_por_numero(conn: psycopg.Connection, ej: Ejecucion, api: BoletinAPI, desde: date, hasta: date,
+                         margen_dias: int = 7) -> None:
+    """La API devuelve un solo boletín por fecha aunque ese día salgan dos (7494 y 7495 el 17/11/2026).
+    Se piden por número los huecos entre los boletines conocidos de la ventana (más unos días antes,
+    para agarrar el hueco con la corrida anterior). Los números que no existen quedan en
+    ctl.numero_consultado y no se vuelven a pedir."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT numero FROM bo.boletin WHERE fecha_publicacion BETWEEN %s AND %s",
+                    (desde - timedelta(days=margen_dias), hasta))
+        conocidos = [r[0] for r in cur.fetchall()]
+        if not conocidos:
+            return
+        cur.execute("SELECT numero FROM ctl.numero_consultado WHERE numero BETWEEN %s AND %s AND resultado <> 'error'",
+                    (min(conocidos), max(conocidos)))
+        consultados = [r[0] for r in cur.fetchall()]
+    for numero in numeros_faltantes(conocidos, consultados):
+        clave = f"numero:{numero}"
+        try:
+            r = api.obtener_boletin_numero(numero)
+        except ErrorAPI as e:
+            ej.error("api_boletin", clave, str(e))
+            marcar_numero(conn, numero, "error")
+            conn.commit()
+            ej.sumar("numeros_error")
+            continue
+        if r.boletin is None:
+            marcar_numero(conn, numero, "inexistente")
+            conn.commit()
+            ej.sumar("numeros_inexistentes")
+            continue
+        if r.error_normas:
+            ej.error("api_boletin", clave, f"normas: {r.error_normas}")
+            marcar_numero(conn, numero, "error")
+            conn.commit()
+            ej.sumar("numeros_error")
+            continue
+        c = guardar_respuesta(conn, r)
+        marcar_numero(conn, numero, "con_boletin")
+        ej.resolver("api_boletin", clave)
+        conn.commit()
+        ej.sumar("boletines")
+        ej.sumar("boletines_por_numero")
+        ej.sumar("normas", c["normas"])
+        ej.sumar("pdf_pendientes", c["pdf_pendientes"])
+        log.info("número %s: boletín del %s, %d normas", numero, r.fecha_publicacion, c["normas"])
+
+
+def marcar_numero(conn: psycopg.Connection, numero: int, resultado: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO ctl.numero_consultado (numero, resultado) VALUES (%s, %s)
+               ON CONFLICT (numero) DO UPDATE SET resultado = EXCLUDED.resultado, consultado_en = now()""",
+            (numero, resultado),
+        )
 
 
 # ---------------------------------------------------------------------------
 # PDFs -> texto
 # ---------------------------------------------------------------------------
+# PDFium no es thread-safe: la extracción se serializa (son ~2-4 ms por PDF; la espera es la red).
+_LOCK_PDFIUM = threading.Lock()
+# PDFium devuelve los guiones como U+00AD (guion blando) o U+FFFE / U+0002 (guion de fin de línea);
+# pdfplumber los da como "-" y el parser espera "-" (p. ej. "EX- 2026-...").
+_GUIONES_PDFIUM = str.maketrans({"\u00ad": "-", "\ufffe": "-", "\u0002": "-"})
+
+
 def extraer_texto_pdf(contenido: bytes) -> tuple[str, int]:
-    import pdfplumber  # import diferido: pesado
-    with pdfplumber.open(io.BytesIO(contenido)) as pdf:
-        paginas = [p.extract_text() or "" for p in pdf.pages]
-    return "\n".join(paginas), len(paginas)
+    """(texto, páginas) con pypdfium2. Unas 10 veces más rápido que pdfplumber con el mismo texto útil."""
+    import pypdfium2 as pdfium  # import diferido
+    with _LOCK_PDFIUM:
+        doc = pdfium.PdfDocument(contenido)
+        try:
+            paginas = []
+            for i in range(len(doc)):
+                pagina = doc[i]
+                tp = pagina.get_textpage()
+                try:
+                    paginas.append(tp.get_text_range())
+                finally:
+                    tp.close()
+                    pagina.close()
+        finally:
+            doc.close()
+    texto = "\n".join(paginas).replace("\r\n", "\n").replace("\r", "\n").translate(_GUIONES_PDFIUM)
+    return texto, len(paginas)
 
 
 def procesar_pdfs(conn: psycopg.Connection, ej: Ejecucion, limite: int = 500, max_intentos: int = 3,
                   session: Optional[requests.Session] = None, timeout: float = 60,
-                  descargar: Optional[Callable[[str], bytes]] = None) -> None:
-    s = session or requests.Session()
-
-    def _bajar(url: str) -> bytes:
-        r = s.get(url, timeout=(10, timeout), headers={"User-Agent": "monitor-licitaciones-caba/2"})
-        r.raise_for_status()
-        return r.content
-
-    descargar = descargar or _bajar
+                  descargar: Optional[Callable[[str], bytes]] = None,
+                  concurrencia: int = CONCURRENCIA_DEFECTO, intervalo: float = INTERVALO_DEFECTO) -> None:
+    """Baja hasta `limite` PDFs pendientes (o con error y menos de `max_intentos`), de a `concurrencia`
+    en paralelo y con `intervalo` segundos mínimos entre pedidos. La descarga y la extracción corren en
+    hilos; TODAS las escrituras a la base se hacen acá, en el hilo que llama (la conexión no es thread-safe)."""
+    des = None
+    if descargar is None:
+        des = Descargador(session or sesion_pdfs(concurrencia), concurrencia=concurrencia,
+                          intervalo=intervalo, timeout=timeout)
+        descargar = des.bajar
     with conn.cursor() as cur:
         cur.execute(
             """SELECT d.id_norma, n.url_norma FROM bo.documento d JOIN bo.norma n USING (id_norma)
@@ -170,30 +275,35 @@ def procesar_pdfs(conn: psycopg.Connection, ej: Ejecucion, limite: int = 500, ma
             (max_intentos, limite),
         )
         pendientes = cur.fetchall()
-    for id_norma, url in pendientes:
-        try:
-            contenido = descargar(url)
-            texto, paginas = extraer_texto_pdf(contenido)
-            estado = "ok" if texto.strip() else "vacio"   # vacío = probablemente escaneado
+    # extraer_texto_pdf se busca en el módulo en cada llamada (los tests lo reemplazan)
+    for res in bajar_y_extraer(pendientes, descargar, lambda b: extraer_texto_pdf(b), concurrencia):
+        id_norma = res.clave
+        if res.error is None:
+            estado = "ok" if res.texto.strip() else "vacio"   # vacío = probablemente escaneado
             with conn.cursor() as cur:
                 cur.execute(
                     """UPDATE bo.documento SET estado=%s, intentos=intentos+1, ultimo_error=NULL, sha256=%s,
                        paginas=%s, texto=%s, extraido_en=now(), actualizado_en=now() WHERE id_norma=%s""",
-                    (estado, hashlib.sha256(contenido).hexdigest(), paginas, texto, id_norma),
+                    (estado, hashlib.sha256(res.contenido).hexdigest(), res.paginas, res.texto, id_norma),
                 )
             ej.resolver("pdf", id_norma)
             ej.sumar(f"pdf_{estado}")
-        except Exception as e:  # noqa: BLE001 - se registra y se sigue
-            msg = f"{type(e).__name__}: {e}"
+        else:
             with conn.cursor() as cur:
                 cur.execute(
                     """UPDATE bo.documento SET estado='error', intentos=intentos+1, ultimo_error=%s,
                        actualizado_en=now() WHERE id_norma=%s""",
-                    (msg[:1000], id_norma),
+                    (res.error[:1000], id_norma),
                 )
-            ej.error("pdf", id_norma, msg)
+            ej.error("pdf", id_norma, res.error)
             ej.sumar("pdf_error")
         conn.commit()
+    if des is not None:
+        lat = des.resumen_latencias()
+        ej.sumar("pdf_pedidos_http", lat["pedidos"])
+        ej.sumar("pdf_reintentos_http", lat["reintentos"])
+        if pendientes:
+            log.info("pdfs: %d documentos, latencias %s", len(pendientes), lat)
 
 
 # ---------------------------------------------------------------------------

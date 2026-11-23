@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS ctl.fecha_consultada (
   consultado_en timestamptz NOT NULL DEFAULT now()
 );
 
+-- Números de boletín pedidos directamente (la API da un solo boletín por fecha aunque ese día
+-- salgan dos; los huecos de numeración se piden por número). 'inexistente' no se vuelve a pedir.
+CREATE TABLE IF NOT EXISTS ctl.numero_consultado (
+  numero        int PRIMARY KEY,
+  resultado     text NOT NULL CHECK (resultado IN ('con_boletin','inexistente','error')),
+  consultado_en timestamptz NOT NULL DEFAULT now()
+);
+
 -- ---------------------------------------------------------------------
 -- REFERENCIA
 -- ---------------------------------------------------------------------
