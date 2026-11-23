@@ -1,0 +1,150 @@
+# =====================================================================
+# Monitor de Licitaciones CABA: producción en un solo servidor.
+#
+# Cinco servicios: db (Postgres 16), web (Next.js en Node), ingesta (corrida
+# diaria del Boletín), backup (pg_dump nocturno a R2) y cloudflared (túnel de
+# Cloudflare: el servidor no abre ningún puerto de entrada).
+#
+# Las variables salen de deploy/.env (copiá env.example y completalo). Nunca
+# lo commitees. Guía completa: docs/COLABORAR.md.
+#
+# Uso habitual (desde la raíz del repo):
+#   docker compose -f deploy/docker-compose.yml ps
+#   docker compose -f deploy/docker-compose.yml logs -f ingesta
+# =====================================================================
+name: monitor-licitaciones
+
+# Logs rotados para no llenar el disco: hasta 5 archivos de 10 MB por servicio
+x-logs: &logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16-bookworm        # imagen oficial; trae pg_trgm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-boletin_oficial_caba}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD en deploy/.env}
+      # Solo la usa deploy/primera-vez.sh para crear el usuario monitor_web
+      MONITOR_WEB_PASSWORD: ${MONITOR_WEB_PASSWORD:?falta MONITOR_WEB_PASSWORD en deploy/.env}
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+    # Ajustes para un servidor de 4 GB de RAM
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=50
+    shm_size: 256mb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Solo en localhost del servidor (para entrar con un túnel SSH). Nunca en
+    # la interfaz pública: Docker se saltea ufw cuando publica puertos.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *logs
+
+  web:
+    build:
+      context: ../web
+      dockerfile: ../deploy/web/Dockerfile
+    image: monitor-licitaciones/web:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Usuario de solo lectura (más escritura en app.alerta y app.reporte)
+      DATABASE_URL: postgres://monitor_web:${MONITOR_WEB_PASSWORD}@db:5432/${POSTGRES_DB:-boletin_oficial_caba}
+      SITE_URL: ${SITE_URL:-http://localhost:3000}
+      TURNSTILE_ENABLED: ${TURNSTILE_ENABLED:-false}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+    # Solo en localhost, para probar desde el servidor (curl) o con túnel SSH.
+    # El público entra por cloudflared.
+    ports:
+      - "127.0.0.1:3000:3000"
+    mem_limit: 768m
+    logging: *logs
+
+  ingesta:
+    build:
+      context: ..
+      dockerfile: deploy/ingesta/Dockerfile
+    image: monitor-licitaciones/ingesta:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MLC_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-boletin_oficial_caba}
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+      INGESTA_HORA: ${INGESTA_HORA:-07:30}
+      INGESTA_LIMITE_PDFS: ${INGESTA_LIMITE_PDFS:-2000}
+      INGESTA_BAC: ${INGESTA_BAC:-1}
+      LLM_HABILITADO: ${LLM_HABILITADO:-0}
+      LLM_LIMITE: ${LLM_LIMITE:-500}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AVISO_URL_INGESTA: ${AVISO_URL_INGESTA:-}
+    mem_limit: 1536m
+    logging: *logs
+
+  backup:
+    build:
+      context: ..
+      dockerfile: deploy/backup/Dockerfile
+    image: monitor-licitaciones/backup:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-boletin_oficial_caba}
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+      BACKUP_HORA: ${BACKUP_HORA:-03:30}
+      BACKUP_DIARIOS: ${BACKUP_DIARIOS:-14}
+      BACKUP_SEMANALES: ${BACKUP_SEMANALES:-8}
+      BACKUP_DIA_SEMANAL: ${BACKUP_DIA_SEMANAL:-7}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_PREFIJO: ${R2_PREFIJO:-backups}
+      AWS_ENDPOINT_URL: ${R2_ENDPOINT:-}
+      AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: auto
+      AVISO_URL_BACKUP: ${AVISO_URL_BACKUP:-}
+    logging: *logs
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.1
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Token del túnel (Zero Trust > Networks > Tunnels). En el panel, el
+      # "public hostname" tiene que apuntar a http://web:3000
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - web
+    logging: *logs
+
+volumes:
+  pgdata:
