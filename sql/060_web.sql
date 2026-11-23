@@ -173,12 +173,14 @@ BEGIN
 END $$;
 
 -- Permisos para el usuario del sitio, si existe (ver web/README.md):
--- lectura en todo lo analítico, escritura solo en app.
+-- lectura en todo lo analítico, escritura solo en app. De bac y ctl lee solo
+-- lo que muestra el pie del sitio (cantidad de releases y última ingesta).
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'monitor_web') THEN
-    GRANT USAGE ON SCHEMA analitica, web, bo, ref, app TO monitor_web;
-    GRANT SELECT ON ALL TABLES IN SCHEMA analitica, web, bo, ref TO monitor_web;
+    GRANT USAGE ON SCHEMA analitica, web, bo, ref, app, bac, ctl TO monitor_web;
+    GRANT SELECT ON ALL TABLES IN SCHEMA analitica, web, bo, ref, bac TO monitor_web;
+    GRANT SELECT ON ctl.ejecucion TO monitor_web;
     GRANT SELECT, INSERT, UPDATE ON app.alerta, app.reporte TO monitor_web;
     GRANT USAGE ON ALL SEQUENCES IN SCHEMA app TO monitor_web;
   END IF;
