@@ -43,8 +43,8 @@ docker run -d --name mlc-db -p 127.0.0.1:5432:5432 \
 ### Instalar el paquete
 
 ```bash
-git clone https://github.com/oblitterator/boletin_caba.git
-cd boletin_caba
+git clone https://github.com/oblitterator/monitor_licitaciones_caba.git
+cd monitor_licitaciones_caba
 python -m venv .venv
 source .venv/bin/activate            # en Windows: .venv\Scripts\activate
 pip install -e ".[test]"
@@ -172,7 +172,7 @@ docker compose version
 ### 4. Clonar y completar `.env`
 
 ```bash
-git clone https://github.com/oblitterator/boletin_caba.git ~/monitor
+git clone https://github.com/oblitterator/monitor_licitaciones_caba.git ~/monitor
 cd ~/monitor
 cp deploy/env.example deploy/.env
 chmod 600 deploy/.env
@@ -324,7 +324,7 @@ Hace `git pull`, reconstruye las imágenes y reinicia. Si cambió algo en `sql/`
 
 ## Cómo contribuir
 
-1. Buscá algo para hacer en las **Issues** de GitHub (<https://github.com/oblitterator/boletin_caba/issues>) o
+1. Buscá algo para hacer en las **Issues** de GitHub (<https://github.com/oblitterator/monitor_licitaciones_caba/issues>) o
    proponé una nueva. Si vas a tomar una, comentalo ahí para no pisarte con nadie.
 2. Hacé una rama desde `main` con un nombre claro: `git switch -c arreglo-montos-dolares`.
 3. Commits chicos, con mensajes de **una sola oración** que digan qué cambia.
