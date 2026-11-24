@@ -1,0 +1,10 @@
+# Lo que NO entra al build del sitio (contexto: web/)
+node_modules
+.next
+.open-next
+.wrangler
+coverage
+*.tsbuildinfo
+# Nunca meter variables ni secretos en la imagen
+.env*
+.dev.vars*

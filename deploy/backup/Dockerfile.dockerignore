@@ -1,0 +1,4 @@
+# Contexto: la raíz del repo. Solo entran los dos scripts del backup.
+*
+!deploy/programador.sh
+!deploy/backup/backup.sh

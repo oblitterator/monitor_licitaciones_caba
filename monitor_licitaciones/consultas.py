@@ -10,8 +10,13 @@ from .db import conectar
 class Base:
     """Uso: db = Base(); db.df("SELECT * FROM analitica.proceso LIMIT 10")"""
 
-    def __init__(self, dsn: Optional[str] = None):
+    def __init__(self, dsn: Optional[str] = None, timeout_s: Optional[int] = None):
         self.conn = conectar(dsn)
+        if timeout_s:
+            # corta consultas que se van de mambo en vez de dejar colgada la app (y la base) indefinidamente
+            with self.conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = '{int(timeout_s)}s'")
+            self.conn.commit()
         self.conn.read_only = True   # los notebooks nunca escriben en la base
 
     def df(self, sql: str, params: Any = None):

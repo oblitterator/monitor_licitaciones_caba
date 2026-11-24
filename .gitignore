@@ -4,3 +4,13 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .env
+
+# fuentes externas descargadas (se registran en ctl.archivo_fuente; no se versionan)
+datos/
+
+# salida de los comandos lanzados desde la app
+logs/
+
+# Producción (deploy/): variables reales y dumps nunca van al repo
+deploy/.env
+*.dump

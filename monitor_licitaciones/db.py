@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -41,6 +42,9 @@ def init_db(conn: psycopg.Connection) -> list[str]:
     return aplicados
 
 
+log = logging.getLogger(__name__)
+
+
 class Ejecucion:
     """Registra una corrida en ctl.ejecucion y centraliza los errores en ctl.error."""
 
@@ -71,6 +75,16 @@ class Ejecucion:
 
     def sumar(self, clave: str, n: int = 1) -> None:
         self.resumen[clave] = self.resumen.get(clave, 0) + n
+
+    def fase(self, nombre: str) -> None:
+        """Marca la etapa en curso en ctl.ejecucion.resumen (la app la muestra como progreso).
+        Llamar solo entre etapas: hace commit."""
+        self.resumen["fase"] = nombre
+        with self.conn.cursor() as cur:
+            cur.execute("UPDATE ctl.ejecucion SET resumen = %s WHERE id = %s",
+                        (json.dumps(self.resumen, default=str), self.id))
+        self.conn.commit()
+        log.info("fase: %s", nombre)
 
     def cerrar(self, ok: bool) -> None:
         with self.conn.cursor() as cur:
