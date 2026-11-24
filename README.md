@@ -5,6 +5,8 @@ Autónoma de Buenos Aires, orientado a la detección de señales de riesgo en la
 
 **Autor:** Juan Nieve
 
+> ¿Querés sumarte, correrlo en tu máquina o mantener el servidor? Leé **[docs/COLABORAR.md](docs/COLABORAR.md)**.
+
 ---
 
 # 📘 Introducción
@@ -59,6 +61,8 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 | Errores de descarga | Registrados como dato en la tabla de licitaciones | Tabla de control independiente y estados explícitos por documento |
 | Reprocesamiento | Inserción sin actualización: lo fallido permanecía vacío | Cargas idempotentes con actualización y reintentos acotados |
 | Calidad | Sin medición | Vistas de control, casos de prueba con textos reales y muestra para revisión manual |
+| Descarga de PDFs | Secuencial | En paralelo y educada (6 a la vez, 0,15 s entre pedidos, reintentos con Retry-After) |
+| Actos dudosos | Sin respaldo | Respaldo opcional con Claude Haiku, con cada valor verificado contra el texto y sin pisar las reglas |
 
 ---
 
@@ -70,6 +74,8 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 ├── 📂 monitor_licitaciones          # Paquete Python
 │   ├── api_bo.py                    # 📌 Cliente de la API del Boletín Oficial
 │   ├── ingesta.py                   # 📌 Carga de boletines y normas, PDFs → texto, parseo
+│   ├── descarga.py                  # 📌 Descarga educada de PDFs (concurrencia, reintentos, https)
+│   ├── llm.py                       # 📌 Respaldo con Claude Haiku para actos de confianza media/baja
 │   ├── parser_actos.py              # 📌 Extracción por reglas de los actos de licitación
 │   ├── bac.py                       # 📌 Snapshots del OCDS de Buenos Aires Compras
 │   ├── db.py                        # 📌 Conexión y registro de ejecuciones y errores
@@ -79,7 +85,9 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 ├── 📂 sql
 │   ├── 001_esquema.sql              # Tablas y normalización de razones sociales
 │   ├── 020_funciones.sql            # Migración desde v1 y resolución de CUIT
-│   └── 040_analitica.sql            # Vistas de procesos, señales y controles de calidad
+│   ├── 040_analitica.sql            # Vistas de procesos, señales y controles de calidad
+│   ├── 050_llm.sql                  # Extracciones con LLM y su mezcla con las reglas
+│   └── 060_web.sql                  # Vistas materializadas y tablas del sitio
 │
 ├── 📂 app
 │   └── monitor.py                   # Aplicación local de monitoreo (Streamlit)
@@ -90,6 +98,9 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 │   └── _construir.py                # Generación de los notebooks desde código
 │
 ├── 📂 tests                         # Casos con textos reales del Boletín + integración
+├── 📂 web                           # Sitio público (Next.js)
+├── 📂 deploy                        # Producción: Docker Compose y scripts de operación
+├── 📂 docs                          # COLABORAR.md: guía para colaborar y operar
 ├── pyproject.toml
 └── README.md
 ```
@@ -98,10 +109,10 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 
 | Esquema | Contenido |
 |---|---|
-| `bo` | Boletines, normas, texto de los PDFs (`documento`), actos parseados (`acto`) y firmas por acto (`acto_firma`) |
+| `bo` | Boletines, normas, texto de los PDFs (`documento`), actos parseados (`acto`), firmas por acto (`acto_firma`) y extracciones con LLM (`acto_llm`) |
 | `ref` | Padrón de empresas (Registro Nacional de Sociedades + BO + BAC), alias nombre → CUIT, IPC y topes por procedimiento |
 | `bac` | Snapshots del OCDS de Buenos Aires Compras: releases y adjudicaciones |
-| `ctl` | Registro de ejecuciones, errores y fechas consultadas a la API |
+| `ctl` | Registro de ejecuciones, errores, fechas y números de boletín consultados a la API y lotes enviados al LLM |
 | `analitica` | Vistas de procesos, ganadores, proveedores, señales y controles de calidad |
 
 ---
@@ -113,12 +124,28 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 ### Boletines y normas
 - Consulta incremental día a día a la API, con tiempos de espera, reintentos y pausa entre pedidos.
 - Se registra cada fecha consultada, de modo que no se vuelven a consultar días sin edición.
-- Se utiliza la fecha informada por el propio boletín, no la consultada.
+- Se utiliza la fecha informada por el propio boletín, no la consultada: para una fecha sin edición la API no
+  devuelve 404 sino el **último** boletín publicado. Si ese boletín es posterior a la fecha, la fecha queda como
+  `sin_boletin`; si es anterior (la fecha es posterior a todo lo publicado: puede que ese día todavía no haya salido),
+  la fecha no se marca y se vuelve a consultar en la corrida siguiente.
+- La API devuelve **un solo boletín por fecha** aunque ese día se publiquen dos (p. ej. 7494 y 7495 el 17/11/2026).
+  Después de recorrer las fechas se piden por número los huecos de numeración (`/obtenerBoletin/{numero}/true`).
+  Un número inexistente también devuelve el último boletín, así que se compara el número devuelto con el pedido; los
+  inexistentes quedan en `ctl.numero_consultado` y no se vuelven a pedir.
 - Boletines y normas se guardan junto con su JSON original (`raw`).
 
 ### Documentos
 - Para las normas de la sección **Licitaciones** se descarga el PDF y se extrae el texto.
+- La descarga es en paralelo y educada: 6 pedidos a la vez como máximo (`--concurrencia`, hasta 8), al menos 0,15 s
+  entre el inicio de dos pedidos (`--intervalo`), reintentos con backoff exponencial y jitter ante cortes, timeouts,
+  429 y 5xx, respetando `Retry-After`. Los `url_norma` vienen en `http://` y se piden directo en `https://` (así se
+  evita el salto 302 del balanceador). El primer pedido de un PDF tarda varios segundos (el servidor lo genera) y los
+  siguientes unos 0,2 s, así que el paralelismo es lo que más acelera.
+- La descarga y la extracción corren en hilos; todas las escrituras a la base se hacen en el hilo principal.
+- El texto se extrae con **pypdfium2** (unas 14 veces más rápido que pdfplumber; en una muestra de 80 PDFs el parser
+  dio exactamente lo mismo con ambos textos).
 - Cada documento tiene un estado explícito: `pendiente`, `ok`, `vacio` (probablemente escaneado) o `error`.
+  Si la respuesta no es un PDF (p. ej. una página de mantenimiento) queda como `error`, no como texto vacío.
 - Los errores se registran en `ctl.error` y se reintentan hasta un máximo configurable.
 
 ### Buenos Aires Compras
@@ -198,7 +225,22 @@ contratación menor muy por encima de lo habitual para el año).
 | `s_domicilio_compartido` | Firmas distintas con igual domicilio fiscal en un mismo acto | Requiere CUIT resuelto para ambas |
 | `s_modificaciones` | Procesos con prórrogas, ampliaciones o modificaciones | Solo lo publicado en la sección Licitaciones |
 
-### 7. Controles de calidad
+### 7. Respaldo con LLM (opcional)
+Los actos que el parser deja en confianza `media` o `baja` pueden mandarse a **Claude Haiku** (`claude-haiku-5-5`)
+por la Message Batches API (mitad de precio), con salida estructurada (JSON schema) y el prompt de sistema en caché.
+- Cada valor (etapa, código de proceso, monto total y moneda, firmas con rol, CUIT y monto) viene con una cita
+  textual. Se acepta solo si la cita aparece en el texto del PDF **y** contiene el valor; además el CUIT tiene que
+  tener dígito verificador válido y el código el formato BAC o SIGAF. Lo que no se verifica se descarta y queda en
+  `rechazos`.
+- Los resultados van a `bo.acto_llm`, con clave `(id_norma, modelo, versión de prompt)` y el sha256 del PDF. **Nunca
+  se pisa `bo.acto`.** Si el PDF cambia, la extracción deja de valer y el acto vuelve a la cola.
+- Regla de mezcla (`analitica.acto_consolidado`): las reglas mandan; el LLM solo completa campos vacíos de actos de
+  confianza media o baja. Cada valor indica su fuente (`*_fuente` = `reglas` | `llm`). Cuando las dos fuentes tienen
+  valor y no coinciden, el acto aparece en `analitica.control_llm` para revisión manual.
+- `analitica.calidad_llm` resume cuántos actos completó el LLM y qué campos.
+- Las vistas `proceso`, `ganador` y las señales siguen usando solo las reglas.
+
+### 8. Controles de calidad
 - `calidad_documentos`, `calidad_parser`, `calidad_resolucion`: cobertura de cada etapa.
 - `control_montos`: actos en los que la suma de los montos por firma no coincide con el total declarado.
 - `pendientes_cuit`: firmas sin CUIT ordenadas por impacto, con candidatos del padrón.
@@ -216,7 +258,7 @@ git clone https://github.com/oblitterator/monitor_licitaciones_caba.git
 cd monitor_licitaciones_caba
 python -m venv .venv
 .venv\Scripts\activate
-python -m pip install -e ".[test,notebooks]"
+python -m pip install -e ".[test,notebooks]"   # agregar ",llm" para usar llm-enviar / llm-recolectar
 $env:MLC_DSN = "postgresql://usuario:clave@127.0.0.1:5432/boletin_oficial_caba"
 ```
 
@@ -252,14 +294,28 @@ Todos los comandos son idempotentes. Cada ejecución queda registrada en `ctl.ej
 | `init-db` | Crea o actualiza la estructura de la base |
 | `migrar-v1` | Copia normas, textos y padrón de empresas desde el esquema `public` de la versión 1 |
 | `boletines --desde --hasta` | Descarga boletines y normas de la API |
-| `pdfs --limite N` | Descarga PDFs pendientes y extrae su texto |
+| `pdfs [--limite N] [--concurrencia 6] [--intervalo 0.15]` | Descarga PDFs pendientes en paralelo y extrae su texto |
 | `parsear [--todo]` | Parsea actos nuevos o procesados con una versión anterior del parser |
 | `clasificar` | Asigna categoría y subcategoría a todos los actos (se ejecuta solo al final de `parsear`) |
 | `resolver` | Resuelve el CUIT de las firmas |
 | `bac [--archivo]` | Registra un snapshot del OCDS de BAC |
 | `ipc --csv` | Carga la serie de IPC para expresar montos en pesos constantes |
-| `actualizar` | Ejecuta la actualización completa |
+| `actualizar [--concurrencia 6]` | Ejecuta la actualización completa |
 | `calidad` | Informa cobertura y calidad de la extracción |
+| `llm-enviar [--dry-run] [--limite N] [--confianza media,baja] [--archivo f.jsonl]` | Manda los actos dudosos a Claude Haiku por la Batches API; con `--dry-run` solo cuenta los pedidos y estima el costo |
+| `llm-recolectar [--lote ID]` | Baja los resultados de los lotes terminados, verifica cada valor y los guarda en `bo.acto_llm` |
+
+## Respaldo con LLM
+
+```powershell
+python -m pip install -e ".[llm]"
+python -m monitor_licitaciones llm-enviar --dry-run     # cuántos pedidos y costo estimado; no manda nada
+$env:ANTHROPIC_API_KEY = "..."                          # la clave se toma solo de esta variable de entorno
+python -m monitor_licitaciones llm-enviar
+python -m monitor_licitaciones llm-recolectar           # repetir hasta que los lotes terminen (minutos a horas)
+```
+
+El costo del dry-run es una estimación a ojo (caracteres / 3); para un número exacto se puede usar `count_tokens`.
 
 ## Aplicación de monitoreo
 
@@ -317,6 +373,7 @@ Estas cifras describen **cobertura**, no precisión. La precisión se estima med
   manuales o información de BAC.
 - **Moneda:** se registra la moneda de cada monto; las señales en pesos excluyen los importes en dólares.
 - **Documentos escaneados:** quedan en estado `vacio`; no se aplica OCR.
+- **LLM:** solo se mandan actos de hasta ~250.000 caracteres (arriba de 100.000 tokens Haiku cobra otra tarifa).
 - **BAC:** el archivo publicado no incluye oferentes y cubre solo el período vigente.
 - **Clasificación:** basada en palabras clave; un objeto genérico («Adquisición de insumos») toma la categoría del
   rubro declarado, que a veces corresponde al organismo y no a lo comprado.
@@ -329,7 +386,7 @@ Estas cifras describen **cobertura**, no precisión. La precisión se estima med
 # 🧪 Pruebas
 
 ```powershell
-python -m pytest tests/test_parser.py                     # no requiere base de datos
+python -m pytest tests/test_parser.py tests/test_descarga.py tests/test_boletines.py tests/test_llm.py tests/test_extraccion.py   # no requieren base ni red
 $env:MLC_TEST_DSN = "postgresql://usuario:clave@127.0.0.1:5432/mlc_test"   # base descartable
 python -m pytest
 ```

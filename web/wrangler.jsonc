@@ -1,0 +1,45 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "monitor-licitaciones-caba",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  // Conexión a Postgres en producción. Crear con:
+  //   wrangler hyperdrive create monitor-licitaciones --connection-string="<cadena del usuario monitor_web>"
+  // y pegar acá el id que devuelve (no es un secreto, pero es propio de cada cuenta).
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "<ID_DE_HYPERDRIVE>",
+      // Solo para `wrangler dev` / `pnpm preview`; se puede pisar con
+      // CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE.
+      "localConnectionString": "postgres://usuario:clave@127.0.0.1:5432/boletin_oficial_caba"
+    }
+  ],
+  // Caché incremental de Next (ver open-next.config.ts). Crear con:
+  //   wrangler r2 bucket create monitor-licitaciones-cache
+  "r2_buckets": [
+    {
+      "binding": "NEXT_INC_CACHE_R2_BUCKET",
+      "bucket_name": "monitor-licitaciones-cache"
+    }
+  ],
+  "services": [
+    {
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "monitor-licitaciones-caba"
+    }
+  ],
+  // Variables no secretas. Los secretos (TURNSTILE_SECRET_KEY) van con
+  //   wrangler secret put TURNSTILE_SECRET_KEY
+  "vars": {
+    "TURNSTILE_ENABLED": "false",
+    "TURNSTILE_SITE_KEY": "",
+    "SITE_URL": "https://example.org"
+  },
+  "observability": { "enabled": true }
+}

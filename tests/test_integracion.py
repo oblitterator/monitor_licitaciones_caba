@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 psycopg = pytest.importorskip("psycopg")
 DSN = os.environ.get("MLC_TEST_DSN")
@@ -335,7 +336,12 @@ def test_pdfs_en_paralelo(conn, tmp_path):
     conn.commit()
     try:
         with ejecucion(conn, "test-pdfs") as ej:
-            n = ingesta.procesar_pdfs(conn, ej, limite=100, hilos=3, pausa=0, proposito="licitacion")
+            # el descargador pasa todo a https; el servidor de prueba es http
+            def bajar(u):
+                r = requests.get(u.replace("https://", "http://", 1), timeout=5)
+                r.raise_for_status()
+                return r.content
+            n = ingesta.procesar_pdfs(conn, ej, limite=100, concurrencia=3, proposito="licitacion", descargar=bajar)
         assert n == 6
         with conn.cursor() as cur:
             cur.execute("""SELECT estado, count(*) FROM bo.documento WHERE id_norma BETWEEN 7770000 AND 7770005
@@ -358,11 +364,13 @@ def test_pdfs_frena_si_el_boletin_se_cae(conn):
             cur.execute("INSERT INTO bo.documento (id_norma, estado, proposito) VALUES (%s, 'pendiente', 'licitacion')",
                         (6660000 + i,))
     conn.commit()
-    for hilos in (1, 3):
+    def caido(u):
+        raise requests.ConnectionError("conexión rechazada")
+    for concurrencia in (1, 3):
         with pytest.raises(ingesta.ServidorCaido):
             with ejecucion(conn, "test-caida") as ej:
-                ingesta.procesar_pdfs(conn, ej, limite=40, hilos=hilos, pausa=0, proposito="licitacion",
-                                      max_intentos=5)
+                ingesta.procesar_pdfs(conn, ej, limite=40, concurrencia=concurrencia, proposito="licitacion",
+                                      max_intentos=5, descargar=caido)
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FILTER (WHERE intentos = 0) FROM bo.documento WHERE id_norma BETWEEN 6660000 AND 6660039")
         assert cur.fetchone()[0] > 0
@@ -402,3 +410,133 @@ Director"""
     assert filas[1][2] == "Ministerio de Educación"          # renombre normalizado
     assert filas[2][1:4] == ("XYZQ (Legislatura de la Ciudad de Buenos Aires)",
                              "Legislatura de la Ciudad de Buenos Aires", "Legislativo")
+
+
+def test_pdfs_concurrentes_escriben_en_el_hilo_principal(conn):
+    import threading
+    import time
+    ids = list(range(910001, 910013))
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO bo.boletin (numero, fecha_publicacion) VALUES (7101, '2025-03-03') ON CONFLICT DO NOTHING")
+        for i in ids:
+            cur.execute("""INSERT INTO bo.norma (id_norma, boletin_numero, fecha_publicacion, seccion, nombre, url_norma)
+                           VALUES (%s, 7101, '2025-03-03', 'Licitaciones', 'x', %s)""", (i, f"http://h/{i}.pdf"))
+            cur.execute("INSERT INTO bo.documento (id_norma, estado) VALUES (%s, 'pendiente')", (i,))
+    conn.commit()
+    vistos, hilos = [], set()
+
+    def bajar(url):
+        hilos.add(threading.current_thread().name)
+        vistos.append(url)
+        time.sleep(0.02)
+        if url.endswith("910003.pdf"):
+            raise TimeoutError("timeout simulado")
+        return b"%PDF-" + url.encode()
+
+    orig = ingesta.extraer_texto_pdf
+    ingesta.extraer_texto_pdf = lambda b: ("" if b.endswith(b"910004.pdf") else "Llamado N° 1\n", 1)
+    try:
+        with ejecucion(conn, "test_pdfs") as ej:
+            ingesta.procesar_pdfs(conn, ej, descargar=bajar, concurrencia=4, limite=100)
+    finally:
+        ingesta.extraer_texto_pdf = orig
+    assert all(u.startswith("https://") for u in vistos) and all(h.startswith("pdf") for h in hilos)
+    with conn.cursor() as cur:
+        cur.execute("SELECT estado, count(*) FROM bo.documento WHERE id_norma BETWEEN 910001 AND 910012 GROUP BY 1")
+        assert dict(cur.fetchall()) == {"ok": 10, "vacio": 1, "error": 1}
+        cur.execute("SELECT intentos, ultimo_error FROM bo.documento WHERE id_norma = 910003")
+        assert cur.fetchone() == (1, "TimeoutError: timeout simulado")
+        cur.execute("SELECT count(*) FROM ctl.error WHERE etapa='pdf' AND clave='910003' AND resuelto_en IS NULL")
+        assert cur.fetchone()[0] == 1
+
+
+def test_boletines_dos_el_mismo_dia_y_dia_sin_publicar(conn):
+    def resp(numero, fecha_pub, id_norma):
+        return {"boletin": {"numero": numero, "fecha_publicacion": fecha_pub},
+                "normas": {"normas": {"Licitaciones": {"Licitación Pública": {"Org": [
+                    {"id_norma": id_norma, "nombre": "Licitación Pública / Llamado N° 1/X/26", "url_norma": "http://x/a.pdf"}]}}}}}
+
+    por_fecha = {date(2026, 11, 17): resp(7494, "17/11/2026", 920001),
+                 date(2026, 11, 18): resp(7496, "18/11/2026", 920003)}
+    ultimo = resp(7496, "18/11/2026", 920003)
+
+    class APIFalsa:
+        numeros = []
+
+        def obtener_boletin(self, fecha):
+            return interpretar_respuesta(fecha, por_fecha.get(fecha, ultimo))
+
+        def obtener_boletin_numero(self, numero):
+            APIFalsa.numeros.append(numero)
+            if numero == 7495:
+                return interpretar_respuesta(None, resp(7495, "17/11/2026", 920002))
+            return interpretar_respuesta(None, {})
+
+    with ejecucion(conn, "test_numeros") as ej:
+        ingesta.cargar_boletines(conn, ej, APIFalsa(), date(2026, 11, 17), date(2026, 11, 19))
+        assert APIFalsa.numeros == [7495]
+        assert ej.resumen["fechas_sin_publicar_aun"] == 1       # 19/11 devolvió el boletín del 18
+        ingesta.cargar_boletines(conn, ej, APIFalsa(), date(2026, 11, 17), date(2026, 11, 19))
+        assert APIFalsa.numeros == [7495]                         # no se vuelve a pedir
+    with conn.cursor() as cur:
+        cur.execute("SELECT numero, fecha_publicacion FROM bo.boletin WHERE numero BETWEEN 7494 AND 7496 ORDER BY 1")
+        assert [r[0] for r in cur.fetchall()] == [7494, 7495, 7496]
+        cur.execute("SELECT boletin_numero FROM bo.norma WHERE id_norma = 920002")
+        assert cur.fetchone()[0] == 7495
+        cur.execute("SELECT estado FROM bo.documento WHERE id_norma = 920002")
+        assert cur.fetchone()[0] == "pendiente"
+        cur.execute("SELECT fecha, resultado FROM ctl.fecha_consultada WHERE fecha BETWEEN '2026-11-17' AND '2026-11-19' ORDER BY 1")
+        assert cur.fetchall() == [(date(2026, 11, 17), "con_boletin"), (date(2026, 11, 18), "con_boletin")]
+
+
+def test_llm_no_pisa_reglas_y_consolida(conn):
+    from types import SimpleNamespace as NS
+    from monitor_licitaciones import llm
+    texto = ("Preadjudicación - Licitación Pública\nObjeto: insumos\n"
+             "Proceso de compra 401-0147-LPU22. Firma preadjudicada: Acme S.A. por $ 1.234.567,89\n")
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO bo.norma (id_norma, fecha_publicacion, seccion, nombre)
+                       VALUES (930001, '2025-04-01', 'Licitaciones', 'Licitación Pública / Preadjudicación N° 1/X/22')""")
+        cur.execute("INSERT INTO bo.documento (id_norma, estado, sha256, texto) VALUES (930001, 'ok', %s, %s)",
+                    ("f" * 64, texto))
+        cur.execute("""INSERT INTO bo.acto (id_norma, etapa, confianza, faltantes, parser_version, monto_total, moneda)
+                       VALUES (930001, 'preadjudicacion', 'baja', '{codigo_proceso,firma}', 'test', 1000, 'ARS')""")
+    conn.commit()
+    filas = llm.actos_a_enviar(conn)
+    assert [f[0] for f in filas if f[0] == 930001] == [930001]
+    datos = {"etapa": {"valor": "preadjudicacion", "evidencia": "Preadjudicación - Licitación Pública"},
+             "codigo_proceso": {"valor": "401-0147-LPU22", "evidencia": "Proceso de compra 401-0147-LPU22."},
+             "monto_total": {"valor": 1234567.89, "moneda": "ARS", "evidencia": "Acme S.A. por $ 1.234.567,89"},
+             "firmas": [{"nombre": "Acme S.A.", "rol": "preadjudicada", "evidencia": "Firma preadjudicada: Acme S.A.",
+                         "cuit": None, "cuit_evidencia": None, "monto": 1234567.89, "moneda": "ARS",
+                         "monto_evidencia": "Acme S.A. por $ 1.234.567,89"}]}
+    cid = llm.custom_id(930001, "f" * 64)
+    res = NS(custom_id=cid, result=NS(type="succeeded", message=NS(
+        content=[NS(type="text", text=json.dumps(datos))], stop_reason="end_turn", usage=None)))
+    fila = llm.interpretar_resultado(res, texto)
+    assert fila["estado"] == "ok"
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO ctl.lote_llm (lote_id, modelo, prompt_version, pedidos) VALUES ('msgbatch_test', %s, %s, 1)",
+                    (llm.MODELO, llm.VERSION_PROMPT))
+        llm.guardar_resultado(cur, "msgbatch_test", llm.MODELO, llm.VERSION_PROMPT, cid, fila, "f" * 64)
+        conn.commit()
+        # las reglas no se tocan
+        cur.execute("SELECT codigo_proceso, monto_total FROM bo.acto WHERE id_norma = 930001")
+        assert cur.fetchone() == (None, 1000)
+        # consolidado: el código lo completa el LLM; el monto de las reglas manda
+        cur.execute("""SELECT codigo_proceso, codigo_fuente, monto_total, monto_fuente, usa_llm
+                       FROM analitica.acto_consolidado WHERE id_norma = 930001""")
+        assert cur.fetchone() == ("401-0147-LPU22", "llm", 1000, "reglas", True)
+        # y como los montos difieren, va a control
+        cur.execute("SELECT monto_reglas, monto_llm FROM analitica.control_llm WHERE id_norma = 930001")
+        assert [float(x) for x in cur.fetchone()] == [1000.0, pytest.approx(1234567.89)]
+        cur.execute("SELECT nombre_raw, rol, monto FROM analitica.acto_llm_firma WHERE id_norma = 930001")
+        assert cur.fetchone()[:2] == ("Acme S.A.", "preadjudicada")
+        # ya enviado y vigente: no se vuelve a mandar
+        assert 930001 not in [f[0] for f in llm.actos_a_enviar(conn)]
+        # si cambia el PDF, la extracción deja de valer y el acto vuelve a la cola
+        cur.execute("UPDATE bo.documento SET sha256 = %s WHERE id_norma = 930001", ("e" * 64,))
+        conn.commit()
+        cur.execute("SELECT count(*) FROM analitica.acto_llm_v WHERE id_norma = 930001")
+        assert cur.fetchone()[0] == 0
+        assert 930001 in [f[0] for f in llm.actos_a_enviar(conn)]

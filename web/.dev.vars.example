@@ -1,0 +1,5 @@
+# Variables para `pnpm preview` (wrangler). Copiar a .dev.vars; no commitear.
+TURNSTILE_ENABLED=false
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=
+SITE_URL=http://localhost:8787

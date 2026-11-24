@@ -6,8 +6,14 @@ Estructura de respuesta (la misma que usaba la v1):
   {"boletin": {"numero": ..., "fecha_publicacion": "dd/mm/aaaa", ...},
    "normas":  {"normas": {seccion: {tipo: {organismo: [norma, ...]}}}}
               | {"errores": ["..."]}}
-Para fechas sin edición la API puede devolver 404 o el boletín más cercano; por eso
-siempre se usa la fecha que trae el propio boletín, no la consultada.
+Mañas de la API (medidas en nov. 2026):
+  - Para una fecha sin edición (fin de semana, feriado o un día que todavía no salió) no
+    devuelve 404: devuelve el ÚLTIMO boletín publicado. Por eso siempre se usa la fecha que
+    trae el propio boletín, no la consultada.
+  - Una fecha devuelve un solo boletín aunque ese día hayan salido dos (p. ej. 7494 y 7495
+    el 17/11/2026). Para no perder el segundo se consulta también por número
+    (/obtenerBoletin/{numero}/true); un número que no existe también devuelve el último,
+    así que hay que comparar el número que vuelve con el pedido.
 """
 from __future__ import annotations
 
@@ -39,7 +45,7 @@ def sesion(reintentos: int = 3) -> requests.Session:
 
 @dataclass
 class RespuestaBoletin:
-    fecha_consultada: date
+    fecha_consultada: Optional[date]   # None si se consultó por número
     boletin: Optional[dict]          # None = no hay boletín para esa fecha
     normas: list[dict]               # aplanadas, con seccion/tipo/organismo
     error_normas: Optional[str] = None
@@ -86,7 +92,18 @@ class BoletinAPI:
         self.pausa = pausa
 
     def obtener_boletin(self, fecha: date) -> RespuestaBoletin:
-        url = f"{BASE_URL}/obtenerBoletin/{fecha:%d-%m-%Y}/true"
+        return self._pedir(f"{fecha:%d-%m-%Y}", fecha)
+
+    def obtener_boletin_numero(self, numero: int) -> RespuestaBoletin:
+        """Boletín por número. Si el número no existe la API devuelve el último boletín:
+        en ese caso se devuelve boletin=None (comparar contra el número pedido)."""
+        r = self._pedir(str(int(numero)), None)
+        if r.boletin is not None and str(r.boletin.get("numero")) != str(int(numero)):
+            return RespuestaBoletin(r.fecha_consultada, None, [])
+        return r
+
+    def _pedir(self, parametro: str, fecha: Optional[date]) -> RespuestaBoletin:
+        url = f"{BASE_URL}/obtenerBoletin/{parametro}/true"
         try:
             r = self.s.get(url, timeout=(10, self.timeout))
         except requests.RequestException as e:
@@ -104,7 +121,13 @@ class BoletinAPI:
         return interpretar_respuesta(fecha, data)
 
 
-def interpretar_respuesta(fecha: date, data: Any) -> RespuestaBoletin:
+def a_https(url: str) -> str:
+    """Los url_norma vienen en http:// y el BigIP los redirige (302) a https://: se pide https directo."""
+    u = (url or "").strip()
+    return "https://" + u[len("http://"):] if u[:7].lower() == "http://" else u
+
+
+def interpretar_respuesta(fecha: Optional[date], data: Any) -> RespuestaBoletin:
     if not isinstance(data, dict) or not isinstance(data.get("boletin"), dict) or not data["boletin"].get("numero"):
         return RespuestaBoletin(fecha, None, [])
     boletin = {k: v for k, v in data["boletin"].items() if not (isinstance(k, str) and k.isnumeric())}

@@ -1,0 +1,10 @@
+# Contexto: la raíz del repo. Se excluye todo y se habilita solo lo necesario,
+# así nunca entran dumps, .env ni node_modules.
+*
+!pyproject.toml
+!monitor_licitaciones/
+!sql/
+!deploy/programador.sh
+!deploy/ingesta/corrida.sh
+**/__pycache__
+**/*.pyc

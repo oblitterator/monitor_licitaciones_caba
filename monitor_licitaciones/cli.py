@@ -4,7 +4,8 @@ Comandos (todos idempotentes; se pueden re-ejecutar sin duplicar):
   init-db                       crea/actualiza esquemas, tablas, funciones y vistas
   migrar-v1                     copia normas, textos y padrón de empresas desde public (v1)
   boletines --desde --hasta     baja boletines y normas de la API
-  pdfs [--limite N]             baja PDFs pendientes y extrae texto
+  pdfs [--limite N] [--concurrencia 6] [--intervalo 0.15]
+                                baja PDFs pendientes en paralelo (educado) y extrae texto
   parsear [--todo]              parsea actos de licitación (solo nuevos o de versión vieja)
   descargar FUENTE [--url]      baja una fuente externa (igj_autoridades, rns) a datos/ y la registra
   registrar-archivo FUENTE RUTA registra un archivo bajado a mano (lo mueve a datos/FUENTE/)
@@ -17,11 +18,14 @@ Comandos (todos idempotentes; se pueden re-ejecutar sin duplicar):
   ipc --csv f.csv               carga serie IPC (columnas: mes=AAAA-MM, indice)
   actualizar                    corrida diaria: boletines desde la última fecha + pdfs + parsear + resolver
   calidad                       muestra cobertura y calidad de la extracción
+  llm-enviar [--dry-run]        manda los actos de confianza media/baja a Claude Haiku (Batches API)
+  llm-recolectar [--lote ID]    baja los resultados del batch, los verifica y los guarda en bo.acto_llm
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import sys
 import time
@@ -29,7 +33,9 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from . import bac as bac_mod
+from . import llm as llm_mod
 from .api_bo import BoletinAPI
+from .descarga import CONCURRENCIA_DEFECTO, CONCURRENCIA_MAXIMA, INTERVALO_DEFECTO
 from .db import conectar, ejecucion, init_db
 from .fuentes import FUENTES, descargar, registrar_local
 from . import igj as igj_mod
@@ -41,6 +47,13 @@ log = logging.getLogger("monitor_licitaciones")
 
 def _fecha(s: str) -> date:
     return date.fromisoformat(s)
+
+
+def _concurrencia(s: str) -> int:
+    n = int(s)
+    if not 1 <= n <= CONCURRENCIA_MAXIMA:
+        raise argparse.ArgumentTypeError(f"entre 1 y {CONCURRENCIA_MAXIMA} (es un servidor público)")
+    return n
 
 
 def _imprimir(cur) -> None:
@@ -79,7 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("pdfs")
     d.add_argument("--limite", type=int, default=500)
     d.add_argument("--max-intentos", type=int, default=3)
-    d.add_argument("--hilos", type=int, default=1, help="descargas en paralelo (3 es razonable; más puede saturar el Boletín)")
+    d.add_argument("--concurrencia", "--hilos", dest="concurrencia", type=_concurrencia, default=CONCURRENCIA_DEFECTO,
+                   help="descargas en paralelo (--hilos es el nombre viejo)")
+    d.add_argument("--intervalo", type=float, default=INTERVALO_DEFECTO, help="segundos mínimos entre pedidos")
     d.add_argument("--todos", action="store_true",
                    help="seguir por tandas de --limite hasta que no queden pendientes (se puede cortar con Ctrl+C y retomar)")
     pa = sub.add_parser("parsear")
@@ -92,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     ip.add_argument("--csv", type=Path, required=True)
     ac = sub.add_parser("actualizar")
     ac.add_argument("--limite-pdfs", type=int, default=2000)
+    ac.add_argument("--concurrencia", type=_concurrencia, default=CONCURRENCIA_DEFECTO, help="descargas de PDF en paralelo")
     sub.add_parser("calidad")
     de = sub.add_parser("descargar", help="baja una fuente externa a datos/ y la registra (url, fecha, sha256)")
     de.add_argument("fuente", choices=sorted(FUENTES))
@@ -110,6 +126,13 @@ def main(argv: list[str] | None = None) -> int:
     ig.add_argument("--forzar", action="store_true", help="recargar cortes ya cargados")
     ig.add_argument("--descargar", action="store_true", help="bajar antes el zip vigente de IGJ")
     ig.add_argument("--url", help="URL del zip si cambió la publicación (con --descargar)")
+    le = sub.add_parser("llm-enviar")
+    le.add_argument("--dry-run", action="store_true", help="no manda nada: cuenta pedidos y estima el costo")
+    le.add_argument("--limite", type=int, help="máximo de actos a mandar")
+    le.add_argument("--confianza", default=",".join(llm_mod.CONFIANZAS_DEFECTO), help="confianzas a mandar (media,baja)")
+    le.add_argument("--archivo", type=Path, help="escribe los pedidos en un JSONL (para revisarlos)")
+    lr = sub.add_parser("llm-recolectar")
+    lr.add_argument("--lote", help="id de un batch puntual (por defecto, todos los pendientes)")
     a = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
@@ -153,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not quedan:
                     break
                 try:
-                    hechos = procesar_pdfs(conn, ej, limite=a.limite, max_intentos=a.max_intentos, hilos=a.hilos)
+                    hechos = procesar_pdfs(conn, ej, limite=a.limite, max_intentos=a.max_intentos,
+                                           concurrencia=a.concurrencia, intervalo=a.intervalo)
                     caidas = 0
                 except ServidorCaido as e:
                     caidas += 1
@@ -281,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             cargar_boletines(conn, ej, BoletinAPI(), desde, date.today())
             ej.fase("pdf_licitacion")
             try:
-                procesar_pdfs(conn, ej, limite=a.limite_pdfs, proposito="licitacion")
+                procesar_pdfs(conn, ej, limite=a.limite_pdfs, concurrencia=a.concurrencia, proposito="licitacion")
             except ServidorCaido as e:
                 print(f"El Boletín parece caído ({e}); los PDF que faltan quedan para la próxima.", flush=True)
                 ej.sumar("pdf_cortado_por_caida")
@@ -294,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
             ej.fase("pdf_designacion")
             encolar_designaciones(conn)
             try:
-                procesar_pdfs(conn, ej, limite=a.limite_pdfs, proposito="designacion")
+                procesar_pdfs(conn, ej, limite=a.limite_pdfs, concurrencia=a.concurrencia, proposito="designacion")
             except ServidorCaido as e:
                 print(f"El Boletín parece caído ({e}); los PDF que faltan quedan para la próxima.", flush=True)
                 ej.sumar("pdf_cortado_por_caida")
@@ -313,6 +337,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"== {titulo}")
                     cur.execute(q)
                     _imprimir(cur)
+
+        elif a.cmd == "llm-enviar":
+            confianzas = [c.strip() for c in a.confianza.split(",") if c.strip()]
+            est = llm_mod.enviar(conn, ej, dry_run=a.dry_run, confianzas=confianzas, limite=a.limite,
+                                 archivo=str(a.archivo) if a.archivo else None)
+            print(("== dry-run (no se mandó nada)" if a.dry_run else "== enviado"))
+            print(json.dumps(est, indent=1, ensure_ascii=False))
+
+        elif a.cmd == "llm-recolectar":
+            llm_mod.recolectar(conn, ej, lote_id=a.lote)
 
     print({k: v for k, v in ej.resumen.items()} or "ok")
     return 0

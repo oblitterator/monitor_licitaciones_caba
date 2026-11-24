@@ -10,3 +10,7 @@ datos/
 
 # salida de los comandos lanzados desde la app
 logs/
+
+# Producción (deploy/): variables reales y dumps nunca van al repo
+deploy/.env
+*.dump
