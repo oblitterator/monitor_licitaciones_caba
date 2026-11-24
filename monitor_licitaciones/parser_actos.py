@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-PARSER_VERSION = "2.3.2"
+PARSER_VERSION = "2.5.0"
 
 # ---------------------------------------------------------------------------
 # Utilidades
@@ -194,6 +194,68 @@ def monto_total(plano: str) -> tuple[Optional[float], Optional[str]]:
             if r is not None:
                 return r
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Montos en letras ("pesos un millón cuatrocientos dieciséis mil"): en los actos del BO la cifra en
+# números a veces trae ceros de más (",00" tipeado ".000"); las letras sirven para detectarlo.
+# ---------------------------------------------------------------------------
+_UNIDADES = {"cero": 0, "un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6,
+             "siete": 7, "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12, "trece": 13, "catorce": 14,
+             "quince": 15, "dieciseis": 16, "diecisiete": 17, "dieciocho": 18, "diecinueve": 19, "veinte": 20,
+             "veintiun": 21, "veintiuno": 21, "veintiuna": 21, "veintidos": 22, "veintitres": 23,
+             "veinticuatro": 24, "veinticinco": 25, "veintiseis": 26, "veintisiete": 27, "veintiocho": 28,
+             "veintinueve": 29, "treinta": 30, "cuarenta": 40, "cincuenta": 50, "sesenta": 60, "setenta": 70,
+             "ochenta": 80, "noventa": 90, "cien": 100, "ciento": 100, "doscientos": 200, "doscientas": 200,
+             "trescientos": 300, "trescientas": 300, "cuatrocientos": 400, "cuatrocientas": 400,
+             "quinientos": 500, "quinientas": 500, "seiscientos": 600, "seiscientas": 600, "setecientos": 700,
+             "setecientas": 700, "ochocientos": 800, "ochocientas": 800, "novecientos": 900, "novecientas": 900}
+_PAL_NUM = set(_UNIDADES) | {"y", "mil", "millon", "millones", "billon", "billones"}
+
+
+def letras_a_numero(texto: str) -> Optional[int]:
+    """'un millón cuatrocientos dieciséis mil' -> 1416000. None si no es un número escrito en letras."""
+    palabras = re.findall(r"[a-zñ]+", _sin_acentos(texto.lower()))
+    if not palabras or (palabras[0] not in _UNIDADES and palabras[0] != "mil"):
+        return None
+    total, grupo, usadas = 0, 0, 0
+    for w in palabras:
+        if w not in _PAL_NUM:
+            break
+        usadas += 1
+        if w == "y":
+            continue
+        if w in _UNIDADES:
+            grupo += _UNIDADES[w]
+        elif w == "mil":
+            grupo = (grupo or 1) * 1000
+            total += grupo
+            grupo = 0
+        elif w in ("millon", "millones"):
+            total = (total + (grupo or 1)) * 1_000_000
+            grupo = 0
+        elif w in ("billon", "billones"):
+            total = (total + (grupo or 1)) * 1_000_000_000_000
+            grupo = 0
+    valor = total + grupo
+    return valor if usadas and valor > 0 else None
+
+
+def montos_en_letras(plano: str) -> list[int]:
+    out = []
+    for m in re.finditer(r"\bpesos\s*:?\s+([a-záéíóúñ ,]{3,260})", plano, re.I):
+        v = letras_a_numero(m.group(1))
+        if v:
+            out.append(v)
+    return out
+
+
+def _factor_de_error(a: float, b: float) -> bool:
+    """a es b multiplicado o dividido por 10, 100, 1000 o 10000 (error de tipeo en la cifra)."""
+    if not a or not b:
+        return False
+    r = a / b if a > b else b / a
+    return any(abs(r - f) <= 0.01 * f for f in (10, 100, 1000, 10000))
 
 
 _NUM_PAL = {"un": 1, "una": 1, "uno": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5,
@@ -409,7 +471,8 @@ def extraer_firmas(lineas: list[str], plano: str) -> tuple[list[Firma], bool]:
                 break
             if re.match(r"^(total|monto adjudicado|monto)\b", l, re.I):
                 # total por firma ("Total: $ 503.640") o monto por firma ("Monto adjudicado: ...")
-                es_total_general = re.match(r"^(total\s+(obra\s+|monto\s+)?(pre\s*-?\s*)?adjudica|monto\s+total|precio\s+total|total\s+general)", l, re.I)
+                es_total_general = re.match(r"^(total\s+(obra\s+|monto\s+)?(pre\s*-?\s*)?adjudica|monto\s+total|precio\s+total|total\s+general"
+                                            r"|total\s*,?\s+(de\s+la\s+)?(pre\s*-?\s*)?adjudicaci)", l, re.I)
                 if es_total_general:
                     break
                 v = primer_monto(" ".join(lineas[j:j + 3]))
@@ -562,6 +625,143 @@ def _deduplicar(firmas: list[Firma]) -> list[Firma]:
     return [por_clave[k] for k in orden]
 
 
+
+# ---------------------------------------------------------------------------
+# Datos de pacientes (datos sensibles de salud publicados en el acto)
+# ---------------------------------------------------------------------------
+# Algunos actos de hospitales nombran al paciente destinatario de la compra
+# ("Marcapasos DDDR - Pte. Pérez Juan", "Prótesis de cadera paciente Gómez Ana").
+# El nombre se reemplaza por una marca en lo que guarda el parser y el acto queda
+# señalado (datos_paciente) para el control de cumplimiento.
+MARCA_PACIENTE = "[dato de paciente omitido]"
+_NOMBRE = r"[A-ZÁÉÍÓÚÑÀÈÌÒÙ][A-Za-zÁÉÍÓÚÑÀÈÌÒÙáéíóúñàèìòùü'´]+"
+_INICIAL = r"[A-ZÁÉÍÓÚÑ]\.?(?![A-Za-zÁÉÍÓÚÑáéíóúñ])"
+_SECUENCIA = rf"{_NOMBRE}(?:(?:\s*,\s*|\s+y\s+|\s+(?:de\s+la|del|de)\s+|\s+)(?:{_NOMBRE}|{_INICIAL})){{0,14}}"
+_PAC_PALABRA = re.compile(rf"\b(pacientes?)(\s*:?\s*)({_SECUENCIA})", re.I)
+_PAC_ABREV = re.compile(rf"\b(Ptes?|Pac)(\.?\s*:?\s*)({_SECUENCIA})")
+# primeras palabras que indican que no sigue un nombre propio
+_NO_NOMBRE = {
+    "firma", "firmas", "renglon", "renglón", "total", "oncologicos", "oncológicos", "pediatricos",
+    "pediátricos", "adultos", "internados", "ambulatorios", "hospital", "servicio", "cantidad", "unidad",
+    "precio", "monto", "dictamen", "rubro", "objeto", "expediente", "renglones", "insumos", "adquisicion",
+    "adquisición", "provision", "provisión", "con", "en", "sin", "que", "nro", "número", "numero", "orden",
+    "farmacia", "cirugia", "cirugía", "unidad", "uco", "neurocirugía", "neurocirugia", "cobaltoterapia",
+    "ginecologia", "ginecología", "oncologia", "oncología", "sala", "historia", "hc", "dni", "obra",
+    "oncologico", "oncológico", "internado", "ambulatorio", "pediatrico", "pediátrico", "adulto", "crónico",
+    "cronico", "cronicos", "crónicos", "quirurgico", "quirúrgico", "quirurgicos", "quirúrgicos",
+    "nutrición", "nutricion", "renal", "renales", "crítico", "critico", "críticos", "criticos", "internación",
+    "internacion", "domiciliario", "domiciliaria", "hemodiálisis", "hemodialisis", "trasplantado",
+}
+# "Av. Pte. Julio A. Roca", "Teatro Pte. Alvear": presidentes en nombres de calles e instituciones
+_LUGAR_ANTES = re.compile(r"(?:Av|Avda|Avenida|[Cc]alle|Pje|Pasaje|Plaza|Estaci[oó]n|Teatro|Escuela|Colegio|"
+                          r"Hospital|Barrio|Parque|Instituto|Villa|Club|Museo|Puente|Autopista)\.?\s*$")
+_PRESIDENTE = re.compile(
+    r"^(?:Julio\s+(?:A\.\s+)?Roca|Roca\b|Roque\s+S[aá]enz|S[aá]enz\s+Pe[ñn]a|Luis\s+S[aá]enz|Per[oó]n\b|"
+    r"Juan\s+(?:D\.|Domingo)\s+Per|Alvear\b|Marcelo\s+T|Sarmiento\b|Mitre\b|Bartolom[eé]\s+Mitre|Uriburu\b|"
+    r"Figueroa\s+Alcorta|Jos[eé]\s+Figueroa|Quintana\b|Manuel\s+Quintana|Yrigoyen\b|Hip[oó]lito|Illia\b|"
+    r"Arturo\s+(?:U\.\s+)?Illia|Frondizi\b|Arturo\s+Frondizi|Avellaneda\b|Nicol[aá]s\s+Avellaneda|"
+    r"Pellegrini\b|Carlos\s+Pellegrini|Derqui\b|Urquiza\b|Justo\s+J)")
+
+
+def _fin_nombre(m: re.Match, texto: str, abreviatura: bool) -> Optional[int]:
+    """Posición donde termina el nombre del paciente dentro de la coincidencia, o None si no es un nombre.
+    La secuencia se corta en la primera palabra que no es parte de un nombre ("Pte Robledo Servicio: ...")."""
+    fin, n = None, 0
+    for t in re.finditer(rf"{_NOMBRE}|{_INICIAL}", m.group(3)):
+        if t.group(0).lower() in _NO_NOMBRE:
+            break
+        fin, n = m.start(3) + t.end(), n + 1
+    if not n:
+        return None
+    nombre = texto[m.start(3):fin]
+    if abreviatura:
+        if _LUGAR_ANTES.search(texto[max(0, m.start() - 14):m.start()]) or _PRESIDENTE.match(nombre):
+            return None
+        return fin
+    # "paciente Gómez Ana", "Paciente: Rodríguez C.", "paciente Recalde": en singular alcanza un apellido;
+    # en plural ("pacientes Internados") se exigen dos palabras
+    if n >= 2 or ":" in m.group(2) or m.group(1).lower() == "paciente":
+        return fin
+    return None
+
+
+def enmascarar_pacientes(texto: Optional[str]) -> tuple[Optional[str], int]:
+    """Devuelve (texto con los nombres de pacientes reemplazados, cantidad de menciones)."""
+    if not texto:
+        return texto, 0
+    n = 0
+    for rx, abrev in ((_PAC_ABREV, True), (_PAC_PALABRA, False)):
+        partes, ultimo = [], 0
+        for m in rx.finditer(texto):
+            fin = _fin_nombre(m, texto, abrev)
+            if fin is None:
+                continue
+            partes.append(texto[ultimo:m.start(3)])
+            partes.append(MARCA_PACIENTE)
+            ultimo = fin
+            n += 1
+        partes.append(texto[ultimo:])
+        texto = "".join(partes)
+    return texto, n
+
+
+# ---------------------------------------------------------------------------
+# Objeto y rubro
+# ---------------------------------------------------------------------------
+_FIN_OBJETO = (r"Acto|Autorizante|Actua|Firma|Firmas|Fecha|Ofertas|Clase|Rubro|Repartici|Norma|Domicilio|"
+               r"Total|Renglón|Fundament\w*|Período|Periodo de impugnaci\w*|Lugar de exhibici\w*|Vencimiento|Dictamen|Observaciones")
+_OBJETO = re.compile(rf"\bObjeto(?:\s+de\s+la\s+contrataci[oó]n)?\s*:?\s*(.{{5,300}}?)(?=\s+(?-i:{_FIN_OBJETO})\b|$)", re.I)
+_OBJETO_LARGO = re.compile(r"\bObjeto(?:\s+de\s+la\s+contrataci[oó]n)?\s*:\s*(.{5,300})", re.I)
+_TITULO_OBJETO = re.compile(
+    r"\b(?:Pre-?adjudicaci[oó]n|Adjudicaci[oó]n|Llamado)\s*-\s*(.{8,200}?)\s*-\s*"
+    r"(?:Licitaci[oó]n|Contrataci[oó]n|Compra|Concurso)", re.I)
+_DESCRIPCION = re.compile(rf"\bDescripci[oó]n\s*:\s*(.{{5,300}}?)(?=\s+(?-i:{_FIN_OBJETO})\b|$)", re.I)
+_CODIGO_PROC = re.compile(r"\b\d{2,4}-\d{3,4}-[A-Z]{3}\d{2}\b|\b\d+-SIGAF/\d{2,4}\b")
+_TRAS_CODIGO = re.compile(
+    r"\s*[-–]?\s*([A-ZÁÉÍÓÚ][^:]{8,200}?)(?=\s+(?:Rubro|Aviso|Fecha|Firmas?|Observaciones|Autorizante|"
+    r"Repartici\w*|Encuadre|Disposici\w*|Apertura|Acta|Expediente|EX-|Licitaci[oó]n|Contrataci[oó]n)\b)")
+_RUBRO = re.compile(rf"\bRubro(?:\s+comercial)?\s*:\s*(.{{3,120}}?)(?=\s+(?-i:Objeto|{_FIN_OBJETO})\b|$)", re.I)
+
+
+_OBJETO_BASURA = re.compile(
+    r"^(?:(?:Licitaci[oó]n|Contrataci[oó]n)\s+\w+\s+(?:BAC\s+)?N\s*[°ºo]|de\s+considerar\s+las\s+propuestas|"
+    r"Carpeta\s+de\s+Compra|DE\s+CARGA|del\s+llamado:?\s*$)", re.I)
+
+
+def extraer_objeto(plano: str) -> Optional[str]:
+    mo = _OBJETO.search(plano)
+    if mo and not _OBJETO_BASURA.match(mo.group(1).strip()):
+        return mo.group(1).strip(' ."“”')[:300]
+    mo = _OBJETO_LARGO.search(plano)
+    if mo and not _OBJETO_BASURA.match(mo.group(1).strip()):   # objeto más largo que 300 caracteres: se corta en el último punto o coma
+        t = mo.group(1)
+        corte = max(t.rfind(". "), t.rfind(", "))
+        return (t[:corte] if corte > 40 else t).strip(' ."“”')
+    mo = _DESCRIPCION.search(plano)
+    if mo:
+        return mo.group(1).strip(' ."“”')[:300]
+    mo = _TITULO_OBJETO.search(plano)
+    if mo:
+        return mo.group(1).strip(' ."“”')
+    # texto que sigue al código del proceso ("... Nº 426-1354-LPU22 Insumos Anatomía Patológica Rubro: Salud")
+    for mc in reversed(list(_CODIGO_PROC.finditer(plano))):
+        mo = _TRAS_CODIGO.match(plano, mc.end())
+        if not mo or _CODIGO_PROC.search(mo.group(1)):
+            continue
+        t = mo.group(1).strip(' ."“”-–')
+        if not re.match(r"(?:cuya|Fecha|Expediente|EX|Ex|E\.E|Licitaci|Contrataci|Acta|Dictamen)\b", t):
+            return t
+    # "Rubro: Adquisición de Películas Radiográficas": el rubro describe la compra
+    r = extraer_rubro(plano)
+    if r and re.match(r"(?:S/\s*)?(?:Adquisici|Servicio|Contrataci|Provisi|Alquiler|Locaci|Compra)", r, re.I):
+        return re.sub(r"^S/\s*", "", r)
+    return None
+
+
+def extraer_rubro(plano: str) -> Optional[str]:
+    m = _RUBRO.search(plano)
+    return m.group(1).strip(' .:-')[:120] if m else None
+
 # ---------------------------------------------------------------------------
 # Resultado
 # ---------------------------------------------------------------------------
@@ -575,7 +775,10 @@ class Acto:
     etapa: Optional[str] = None
     etapa_conflicto: bool = False
     expediente: Optional[str] = None
-    objeto: Optional[str] = None
+    objeto: Optional[str] = None          # con nombres de pacientes enmascarados
+    rubro: Optional[str] = None           # "Rubro comercial:" tal como lo declara el acto
+    datos_paciente: bool = False          # el acto publica nombres de pacientes
+    n_menciones_paciente: int = 0
     monto_total: Optional[float] = None
     monto_origen: Optional[str] = None    # 'texto' | 'suma_firmas'
     moneda: Optional[str] = None
@@ -590,6 +793,27 @@ class Acto:
 
     def como_dict(self) -> dict:
         return asdict(self)
+
+
+def revisar_montos(a: "Acto", plano: str, ganadoras: list[Firma]) -> None:
+    """Corrige ceros de más en la cifra cuando hay otra fuente que la contradice por un factor 10..10000:
+    el monto en letras (prevalece) o la suma de lo adjudicado a cada firma. Deja constancia en monto_origen."""
+    if a.monto_total is None or a.moneda != "ARS":
+        return
+    letras = montos_en_letras(plano)
+    if letras and not any(abs(w - a.monto_total) <= 0.01 * w for w in letras):
+        for w in letras:
+            if _factor_de_error(a.monto_total, w) and monto_valido(w):
+                a.monto_total, a.monto_origen = float(w), "letras"
+                break
+    suma = sum(f.monto for f in ganadoras) if ganadoras and all(f.monto for f in ganadoras) else None
+    if suma and a.monto_origen != "letras" and _factor_de_error(a.monto_total, suma):
+        if a.monto_total > suma:
+            a.monto_total, a.monto_origen = round(suma, 2), "suma_firmas_corregida"
+    # una firma no puede llevarse más que el total: si es la única, se le asigna el total; si no, su monto se descarta
+    for f in ganadoras:
+        if f.monto and f.monto > a.monto_total * 1.05:
+            f.monto = a.monto_total if len(ganadoras) == 1 else None
 
 
 def rol_final(rol: str, etapa: Optional[str]) -> str:
@@ -628,9 +852,10 @@ def parsear_acto(nombre: Optional[str], texto: Optional[str]) -> Acto:
         if re.match(r"^(EX[-\s]|E\.?\s?E\.?|EE\b|Expediente)", l, re.I):
             a.expediente = l[:120]
             break
-    mo = re.search(r"\bObjeto(?:\s+de\s+la\s+contrataci[oó]n)?\s*:?\s*(.{5,300}?)(?=\s+(?:Acto|Autorizante|Actua|Firma|Fecha|Ofertas|Clase|Rubro|Repartici|Norma|Domicilio|Total|Renglón)\b|$)", plano, re.I)
-    if mo:
-        a.objeto = mo.group(1).strip(' ."“”')[:300]
+    a.objeto, _ = enmascarar_pacientes(extraer_objeto(plano))
+    a.rubro = extraer_rubro(plano)
+    _, a.n_menciones_paciente = enmascarar_pacientes(plano)
+    a.datos_paciente = a.n_menciones_paciente > 0
 
     # montos y ofertas
     a.monto_total, a.moneda = monto_total(plano)
@@ -655,6 +880,7 @@ def parsear_acto(nombre: Optional[str], texto: Optional[str]) -> Acto:
     a.firmas = firmas
 
     ganadoras = [f for f in firmas if f.rol in ("adjudicada", "preadjudicada")]
+    revisar_montos(a, plano, ganadoras)
     if (a.monto_total is None and ganadoras and all(f.monto for f in ganadoras)
             and monto_valido(sum(f.monto for f in ganadoras))):
         a.monto_total, a.moneda = round(sum(f.monto for f in ganadoras), 2), "ARS"

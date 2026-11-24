@@ -1,4 +1,4 @@
-﻿# Monitor de Licitaciones CABA
+# Monitor de Licitaciones CABA
 
 Pipeline de extracción, procesamiento y análisis de las contrataciones publicadas en el Boletín Oficial de la Ciudad
 Autónoma de Buenos Aires, orientado a la detección de señales de riesgo en la relación entre organismos y proveedores.
@@ -81,6 +81,9 @@ constitución, domicilios fiscales compartidos entre oferentes y modificaciones 
 │   ├── 020_funciones.sql            # Migración desde v1 y resolución de CUIT
 │   └── 040_analitica.sql            # Vistas de procesos, señales y controles de calidad
 │
+├── 📂 app
+│   └── monitor.py                   # Aplicación local de monitoreo (Streamlit)
+│
 ├── 📂 notebooks
 │   ├── 01_calidad.ipynb             # Cobertura, calidad del parser y revisión manual
 │   ├── 02_senales.ipynb             # Señales de contratación
@@ -133,6 +136,11 @@ De cada acto se extraen:
 - **Firmas** con su rol (`adjudicada`, `preadjudicada`, `oferente`, `desestimada`), su CUIT si figura en el texto y su
   monto cuando el texto lo asigna o puede reconstruirse a partir de los renglones.
 
+- **Objeto** de la contratación y **rubro comercial** declarado.
+- **Datos de pacientes**: cuando el acto nombra al paciente destinatario de la compra (p. ej. «Marcapasos – Pte.
+  …»), el nombre se reemplaza por `[dato de paciente omitido]` en el objeto y el acto queda marcado
+  (`datos_paciente`, `n_menciones_paciente`).
+
 Cada acto lleva un nivel de confianza (`alta`, `media`, `baja`) y la lista de campos faltantes. Ante cambios en las
 reglas se incrementa `PARSER_VERSION`, lo que permite reprocesar únicamente lo afectado.
 
@@ -147,13 +155,38 @@ Se asigna el CUIT a cada firma en el siguiente orden de confianza:
 
 La asignación se realiza **solo si el candidato es único**; ante homónimos la firma queda sin resolver.
 
-### 3. Vistas analíticas
+### 3. Clasificación de compras
+Cada acto recibe una **categoría** (salud, alimentación, obras, informática, etc.) y, para salud, una
+**subcategoría** (medicamentos, prótesis e implantes, reactivos, insumos, equipamiento, servicios). Las reglas son
+expresiones regulares guardadas en `ref.categoria_regla` y se aplican primero sobre el objeto y, si no alcanza, sobre
+el rubro declarado. Las reglas de origen `base` se regeneran en cada `init-db`; las de origen `manual` se conservan.
+
+### 4. Jerarquía de organismos
+Cada unidad compradora se ubica en tres niveles: **poder** (Ejecutivo, Legislativo, Judicial, organismo autónomo),
+**jurisdicción** (el ministerio o área de la que depende) y **unidad** (hospital, dirección general, etc.). La API del
+Boletín agrupa cada norma por jurisdicción, y la unidad que la emite figura como sigla en el nombre de la norma
+(`Contratación Menor / Llamado N° 3986/HGAT/26` → `HGAT`). La unidad se identifica como `SIGLA@jurisdicción`, de
+modo que los renombres de ministerios no la parten en dos. Los nombres largos de las unidades están en
+`ref.unidad_nombre`; las siglas nuevas aparecen como `SIGLA (jurisdicción)` hasta que se cargue su nombre allí con
+`origen = 'manual'`. Los renombres de ministerios se unifican en `ref.jurisdiccion_alias`.
+
+### Montos dudosos
+El parser corrige los ceros de más que el Boletín publica en algunas cifras (`$ 1.416.000.000` cuando el renglón y
+el monto en letras dicen un millón cuatrocientos dieciséis mil), usando el monto en letras o la suma de renglones;
+la corrección queda registrada en `monto_origen`. Lo que no se puede corregir se excluye de los totales: en
+`analitica.ganador`, `monto_asignado` queda vacío y el valor publicado pasa a `monto_original`, con el motivo en
+`monto_revision` (la firma supera el total del acto, el total y la suma por firma difieren 20 veces o más, o una
+contratación menor muy por encima de lo habitual para el año).
+
+### 5. Vistas analíticas
 - `analitica.proceso`: un registro por proceso, con fechas por etapa, montos, ofertas y modificaciones.
 - `analitica.ganador`: adjudicatarios del acto final de cada proceso. El monto se asigna a una firma únicamente
   cuando es inequívoco, de modo que nunca se duplica.
 - `analitica.proveedor`: resumen por CUIT.
+- `analitica.gasto_categoria`: monto por categoría, jurisdicción, organismo, proveedor y año.
+- `analitica.organismo_jerarquia`: unidades compradoras con su poder y jurisdicción.
 
-### 4. Señales
+### 6. Señales
 
 | Vista | Indicador | Consideraciones |
 |---|---|---|
@@ -165,10 +198,12 @@ La asignación se realiza **solo si el candidato es único**; ante homónimos la
 | `s_domicilio_compartido` | Firmas distintas con igual domicilio fiscal en un mismo acto | Requiere CUIT resuelto para ambas |
 | `s_modificaciones` | Procesos con prórrogas, ampliaciones o modificaciones | Solo lo publicado en la sección Licitaciones |
 
-### 5. Controles de calidad
+### 7. Controles de calidad
 - `calidad_documentos`, `calidad_parser`, `calidad_resolucion`: cobertura de cada etapa.
 - `control_montos`: actos en los que la suma de los montos por firma no coincide con el total declarado.
 - `pendientes_cuit`: firmas sin CUIT ordenadas por impacto, con candidatos del padrón.
+- `calidad_clasificacion`: cobertura de la clasificación por año y categoría.
+- `control_datos_personales`: actos publicados con nombres de pacientes (se listan sin los nombres).
 
 ---
 
@@ -219,11 +254,28 @@ Todos los comandos son idempotentes. Cada ejecución queda registrada en `ctl.ej
 | `boletines --desde --hasta` | Descarga boletines y normas de la API |
 | `pdfs --limite N` | Descarga PDFs pendientes y extrae su texto |
 | `parsear [--todo]` | Parsea actos nuevos o procesados con una versión anterior del parser |
+| `clasificar` | Asigna categoría y subcategoría a todos los actos (se ejecuta solo al final de `parsear`) |
 | `resolver` | Resuelve el CUIT de las firmas |
 | `bac [--archivo]` | Registra un snapshot del OCDS de BAC |
 | `ipc --csv` | Carga la serie de IPC para expresar montos en pesos constantes |
 | `actualizar` | Ejecuta la actualización completa |
 | `calidad` | Informa cobertura y calidad de la extracción |
+
+## Aplicación de monitoreo
+
+```powershell
+python -m pip install -e ".[app]"
+streamlit run app/monitor.py
+```
+
+Aplicación local de consulta (solo lectura) que lee la base en vivo. Secciones:
+
+- **Resumen:** indicadores generales, evolución anual y principales proveedores.
+- **Proveedores:** búsqueda por razón social o CUIT; ficha con datos del padrón, señales en las que aparece y detalle
+  de adjudicaciones con enlace al documento original.
+- **Organismos:** concentración, uso de procedimientos de excepción y principales proveedores por unidad operativa.
+- **Señales:** cada indicador con filtro por período.
+- **Calidad de datos:** cobertura, montos inconsistentes y firmas sin CUIT con candidatos del padrón.
 
 ## Notebooks
 
@@ -266,6 +318,10 @@ Estas cifras describen **cobertura**, no precisión. La precisión se estima med
 - **Moneda:** se registra la moneda de cada monto; las señales en pesos excluyen los importes en dólares.
 - **Documentos escaneados:** quedan en estado `vacio`; no se aplica OCR.
 - **BAC:** el archivo publicado no incluye oferentes y cubre solo el período vigente.
+- **Clasificación:** basada en palabras clave; un objeto genérico («Adquisición de insumos») toma la categoría del
+  rubro declarado, que a veces corresponde al organismo y no a lo comprado.
+- **Datos personales:** el texto original de cada documento (`bo.documento.texto`) conserva los nombres de pacientes
+  tal como los publicó el Boletín. Antes de compartir un volcado de la base, excluir esa tabla o enmascararla.
 - **Cobertura:** procesos sin código BAC o SIGAF no se integran a `analitica.proceso`.
 
 ---

@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+app = ["streamlit>=1.50", "pandas>=2"]
 notebooks = ["pandas>=2", "matplotlib>=3.8", "jupyterlab>=4", "nbstripout>=0.7"]
 
 [project.scripts]
